@@ -17,6 +17,7 @@ from torch.optim import Adam
 from torch.nn.functional import pad
 import numpy as np
 import os
+from collections import OrderedDict
 
 
 from torch.nn.functional import pad
@@ -29,9 +30,9 @@ def drop_path(x, drop_rate: float = 0., training: bool = False):
         return x
     keep_rate = 1 - drop_rate
     shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor = keep_rate + torch.rand(shape, dtype=x.dtype, device=x.device)
     random_tensor.floor_()  # binarize
-    output = x.div(keep_prob) * random_tensor
+    output = x.div(keep_rate) * random_tensor
     return output
 
 
@@ -77,6 +78,7 @@ def Train():
     # For each epoch, we iterate from 1979 to 2017
     # dataset_length is the length of your training data, e.g., the sample between 1979 and 2017
     optimizer.zero_grad()
+    dataset_length = 1
     for step in range(dataset_length):
       # Load weather data at time t as the input; load weather data at time t+1/3/6/24 as the output
       # Note the data need to be randomly shuffled
@@ -92,7 +94,7 @@ def Train():
       loss = TensorAbs(output-target) + TensorAbs(output_surface-target_surface) * 0.25
 
       # Call the backward algorithm and calculate the gratitude of parameters
-      Backward(loss)
+      loss.backward()
 
       # Update model parameters with Adam optimizer
       # The learning rate is 5e-4 as in the paper, while the weight decay is 3e-6
@@ -157,7 +159,7 @@ class PanguModel(nn.Module):
         x = self.layer4(x, 8, 360, 181)
 
         # Skip connect, in last dimension(C from 192 to 384)
-        x = Concatenate(skip, x)
+        x = concat(skip, x)
 
         # Recover the output fields from patches
         output, output_surface = self._output_layer(x)
@@ -171,8 +173,9 @@ def LoadConstantMask():
     return torch.from_numpy(land_mask), torch.from_numpy(soil_type), torch.from_numpy(topography)
 
 
-class PatchEmbedding:
+class PatchEmbedding(nn.Module):
     def __init__(self, patch_size, dim):
+        super(PatchEmbedding, self).__init__()
         '''Patch embedding operation'''
         # Here we use convolution to partition data into cubes
         self.conv = Conv3d(in_channels=5, out_channels=dim, kernel_size=patch_size, stride=patch_size)
@@ -185,8 +188,8 @@ class PatchEmbedding:
         # Zero-pad the input
         pad2D = ZeroPad2d((0,0,1,2))
         pad3D = ZeroPad3d((0, 0, 1, 2, 1, 0))
-        input = pad3D(input)
-        input_surface = pad2D(input_surface)
+        input = pad3D(ConstructTensor(input))
+        input_surface = pad2D(ConstructTensor(input_surface))
 
         # Apply a linear projection for patch_size[0]*patch_size[1]*patch_size[2] patches, patch_size = (2, 4, 4) as in the original paper
         print(input.shape)
@@ -209,8 +212,9 @@ class PatchEmbedding:
 
         return x
 
-class PatchRecovery:
+class PatchRecovery(nn.Module):
     def __init__(self, dim):
+        super(PatchRecovery, self).__init__()
         '''Patch recovery operation'''
         # Hear we use two transposed convolutions to recover data
         patch_size = (2, 4, 4)
@@ -221,21 +225,22 @@ class PatchRecovery:
     def forward(self, x, Z, H, W):
         # The inverse operation of the patch embedding operation, patch_size = (2, 4, 4) as in the original paper
         # Reshape x back to three dimensions
-        x = TransposeDimensions(x, (0, 2, 1))
-        x = reshape(x, target_shape=(x.shape[0], x.shape[1], Z, H, W))
+        x = x.permute(0, 2, 1)
+        x = reshape(x, shape=(x.shape[0], x.shape[1], Z, H, W))
 
         # Call the transposed convolution
         output = self.conv(x[:, :, 1:, :, :])
         output_surface = self.conv_surface(x[:, :, 0, :, :])
 
         # Crop the output to remove zero-paddings
-        output = Crop3D(output)
-        output_surface = Crop2D(output_surface)
+        output = crop(output)
+        output_surface = crop(output_surface)
         return output, output_surface
 
 
-class DownSample:
+class DownSample(nn.Module):
     def __init__(self, dim):
+        super(DownSample, self).__init__()
         '''Down-sampling operation'''
         # A linear function and a layer normalization
         self.linear = Linear(4 * dim, 2 * dim, bias=False)
@@ -243,19 +248,20 @@ class DownSample:
 
     def forward(self, x, Z, H, W):
         # Reshape x to three dimensions for downsampling
-        x = reshape(x, target_shape=(x.shape[0], Z, H, W, x.shape[-1]))
+        x = reshape(x, shape=(x.shape[0], Z, H, W, x.shape[-1]))
 
         # Padding the input to facilitate downsampling
-        x = Pad3D(x)
+        pad3D = ZeroPad3d((0, 0, 1, 2, 1, 0))
+        x = pad3D(x)
 
         # Reorganize x to reduce the resolution: simply change the order and downsample from (8, 360, 182) to (8, 180, 91)
         Z, H, W = x.shape
         # Reshape x to facilitate downsampling
-        x = reshape(x, target_shape=(x.shape[0], Z, H // 2, 2, W // 2, 2, x.shape[-1]))
+        x = reshape(x, shape=(x.shape[0], Z, H // 2, 2, W // 2, 2, x.shape[-1]))
         # Change the order of x
         x = x.permute(0, 1, 2, 4, 3, 5, 6)
         # Reshape to get a tensor of resolution (8, 180, 91)
-        x = reshape(x, target_shape=(x.shape[0], Z * (H // 2) * (W // 2), 4 * x.shape[-1]))
+        x = reshape(x, shape=(x.shape[0], Z * (H // 2) * (W // 2), 4 * x.shape[-1]))
 
         # Call the layer normalization
         x = self.norm(x)
@@ -265,8 +271,9 @@ class DownSample:
         return x
 
 
-class UpSample:
+class UpSample(nn.Module):
     def __init__(self, input_dim, output_dim):
+        super(UpSample, self).__init__()
         '''Up-sampling operation'''
         # Linear layers without bias to increase channels of the data
         self.linear1 = Linear(input_dim, output_dim * 4, bias=False)
@@ -283,17 +290,17 @@ class UpSample:
 
         # Reorganize x to increase the resolution: simply change the order and upsample from (8, 180, 91) to (8, 360, 182)
         # Reshape x to facilitate upsampling.
-        x = reshape(x, target_shape=(x.shape[0], 8, 180, 91, 2, 2, x.shape[-1] // 4))
+        x = reshape(x, shape=(x.shape[0], 8, 180, 91, 2, 2, x.shape[-1] // 4))
         # Change the order of x
         x = x.permute(0, 1, 2, 4, 3, 5, 6)
         # Reshape to get Tensor with a resolution of (8, 360, 182)
-        x = reshape(x, target_shape=(x.shape[0], 8, 360, 182, x.shape[-1]))
+        x = reshape(x, shape=(x.shape[0], 8, 360, 182, x.shape[-1]))
 
         # Crop the output to the input shape of the network
-        x = Crop3D(x)
+        x = crop(x)
 
         # Reshape x back
-        x = reshape(x, target_shape=(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3], x.shape[-1]))
+        x = reshape(x, shape=(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3], x.shape[-1]))
 
         # Call the layer normalization
         x = self.norm(x)
@@ -312,7 +319,8 @@ class EarthSpecificLayer(nn.Module):
         print(depth)
         # Construct basic blocks
         for i in range(depth):
-            self.blocks.append(EarthSpecificBlock(dim, drop_path_ratio_list[i], heads))
+            self.blocks.append((str(i), EarthSpecificBlock(dim, drop_path_ratio_list[i], heads)))
+        self.blocks = nn.Sequential(OrderedDict(self.blocks))
 
     def forward(self, x, Z, H, W):
         for i in range(self.depth):
@@ -322,6 +330,28 @@ class EarthSpecificLayer(nn.Module):
             else:
                 self.blocks[i](x, Z, H, W, roll=True)
         return x
+    
+def gen_mask(x_shape,window_size) -> torch.Tensor:
+  # calculate attention mask for SW-MSA
+  img_mask = torch.zeros((1,x_shape[1], x_shape[2], x_shape[3], 1))  # 1 Z H W 1 [1,8,186,360,1] (2,6,12)
+  z_slices = (slice(0, -window_size[0]),
+              slice(-window_size[0], -window_size[0]//2),
+              slice(-window_size[0]//2, None))
+  h_slices = (slice(0, -window_size[1]),
+              slice(-window_size[1], -window_size[1]//2),
+              slice(-window_size[1]//2, None))
+  cnt = 0
+  for z in z_slices:
+    for h in h_slices:
+          img_mask[:,z, h, :, :] = cnt
+          cnt += 1
+# TODO
+  mask_windows = window_partition(img_mask, window_size)  # nW,window_size, window_size, window_size, 1
+  mask_windows=mask_windows.contiguous().view(list(mask_windows.shape[:4])+[-1]) #[1,4,31,30,144]
+  attn_mask = mask_windows.unsqueeze(4) - mask_windows.unsqueeze(5) #[1,4,31,30,144,144]
+  attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+  attn_mask=attn_mask.contiguous().permute(0,3,1,2,4,5).reshape(1,x_shape[3] // window_size[2],(x_shape[1]//window_size[0])*(x_shape[2] // window_size[1]),1,window_size[0] * window_size[1]*window_size[2],window_size[0] * window_size[1]*window_size[2])
+  return attn_mask
 
 
 class EarthSpecificBlock(nn.Module):
@@ -352,9 +382,13 @@ class EarthSpecificBlock(nn.Module):
         shortcut = x
 
         # Reshape input to three dimensions to calculate window attention
-        reshape(x, target_shape=(x.shape[0], Z, H, W, x.shape[2]))
+        x = reshape(x, shape=(x.shape[0], Z, H, W, x.shape[2]))
 
         # Zero-pad input if needed
+        print(x.shape)
+        print("Z H W: " + ", ".join([str(i) for i in [Z, H, W]]))
+        print("windowSize: " + ", ".join([str(i) for i in self.window_size]))
+        pad3D = ZeroPad3d((0, 0, 0, -1, 0, 0))
         x = pad3D(x)
 
         # Store the shape of the input for restoration
@@ -362,46 +396,53 @@ class EarthSpecificBlock(nn.Module):
 
         if roll:
             # Roll x for half of the window for 3 dimensions
-            x = roll3D(x, shift=[self.window_size[0] // 2, self.window_size[1] // 2, self.window_size[2] // 2])
+            x = roll(x, shift=[self.window_size[0] // 2, self.window_size[1] // 2, self.window_size[2] // 2])
             # Generate mask of attention masks
             # If two pixels are not adjacent, then mask the attention between them
             # Your can set the matrix element to -1000 when it is not adjacent, then add it to the attention
-            mask = gen_mask(x)
-        else:
+            # TODO
+            # mask = gen_mask(x)
+        # else:
             # e.g., zero matrix when you add mask to attention
-            mask = no_mask
+            # TODO
+            # mask = no_mask
 
         # Reorganize data to calculate window attention
-        x_window = reshape(x, target_shape=(
-        x.shape[0], Z // window_size[0], window_size[0], H // window_size[1], window_size[1], W // window_size[2],
-        window_size[2], x.shape[-1]))
-        x_window = TransposeDimensions(x_window, (0, 1, 3, 5, 2, 4, 6, 7))
+        x_window = reshape(x, shape=(
+        x.shape[0], Z // self.window_size[0], self.window_size[0], H // self.window_size[1], self.window_size[1], W // self.window_size[2],
+        self.window_size[2], x.shape[-1]))
+        x_window = x_window.permute(0, 1, 3, 5, 2, 4, 6, 7)
 
         # Get data stacked in 3D cubes, which will further be used to calculated attention among each cube
-        x_window = reshape(x_window, target_shape=(-1, window_size[0] * window_size[1] * window_size[2], x.shape[-1]))
+        x_window = reshape(x_window, shape=(-1, self.window_size[0] * self.window_size[1] * self.window_size[2], x.shape[-1]))
+        print("BLOCK X_WINDOW SHAPE")
+        print(x_window.shape)
+        print()
 
         # Apply 3D window attention with Earth-Specific bias
-        x_window = self.attention(x, mask)
+        # TODO: remove the next line if mask is defined
+        mask = 0
+        x_window = self.attention(x_window, mask)
         print(x_window.shape)
 
         # Reorganize data to original shapes
-        x = reshape(x_window, target_shape=((
-        -1, Z // window_size[0], H // window_size[1], W // window_size[2], window_size[0], window_size[1],
-        window_size[2], x_window.shape[-1])))
-        x = TransposeDimensions(x, (0, 1, 4, 2, 5, 3, 6, 7))
+        x = reshape(x_window, shape=(
+        -1, Z // self.window_size[0], H // self.window_size[1], W // self.window_size[2], self.window_size[0], self.window_size[1],
+        self.window_size[2], x_window.shape[-1]))
+        x = x.permute(0, 1, 4, 2, 5, 3, 6, 7)
 
         # Reshape the tensor back to its original shape
-        x = reshape(x_window, target_shape=ori_shape)
+        x = reshape(x_window, shape=ori_shape)
 
         if roll:
             # Roll x back for half of the window
-            x = roll3D(x, shift=[-self.window_size[0] // 2, -self.window_size[1] // 2, -self.window_size[2] // 2])
+            x = roll(x, shift=[-self.window_size[0] // 2, -self.window_size[1] // 2, -self.window_size[2] // 2])
 
         # Crop the zero-padding
-        x = Crop3D(x)
+        x = crop(x)
 
         # Reshape the tensor back to the input shape
-        x = reshape(x, target_shape=(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3], x.shape[4]))
+        x = reshape(x, shape=(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3], x.shape[4]))
 
         # Main calculation stages
         x = shortcut + self.drop_path(self.norm1(x))
@@ -417,7 +458,7 @@ class EarthAttention3D(nn.Module):
         '''
         super(EarthAttention3D, self).__init__()
         # Initialize several operations
-        self.linear1 = Linear(dim, out_features=3, bias=True)
+        self.linear1 = Linear(dim, out_features=3*dim, bias=True)
         self.linear2 = Linear(dim, dim)
         self.softmax = Softmax(dim=-1)
         self.dropout = Dropout(dropout_rate)
@@ -432,6 +473,7 @@ class EarthAttention3D(nn.Module):
         # You can run your code to record it, modify the code and rerun it
         # Record the number of different window types
         input_shape = [14,721,1440]
+        input_shape = [14,726,1440]
         self.type_of_windows = (input_shape[0] // window_size[0]) * (input_shape[1] // window_size[1])
 
         # For each type of window, we will construct a set of parameters according to the paper
@@ -441,12 +483,12 @@ class EarthAttention3D(nn.Module):
 
         # Making these tensors to be learnable parameters
         self.earth_specific_bias = Parameter(self.earth_specific_bias)
-        print('看看我们的模型有哪些parameter:\t', self._parameters, end='\n')
+        # print('看看我们的模型有哪些parameter:\t', self._parameters, end='\n')
         # Initialize the tensors using Truncated normal distribution
         self.earth_specific_bias = torch.nn.init.trunc_normal_(self.earth_specific_bias, std=0.02)
 
         # Construct position index to reuse self.earth_specific_bias
-        self.position_index = self._construct_index()
+        self._construct_index()
 
     def _construct_index(self):
         ''' This function construct the position index to reuse symmetrical parameters of the position bias'''
@@ -490,26 +532,40 @@ class EarthAttention3D(nn.Module):
         original_shape = x.shape
 
         # reshape the data to calculate multi-head attention
-        qkv = reshape(x, target_shape=(x.shape[0], x.shape[1], 3, self.head_number, self.dim // self.head_number))
-        query, key, value = TransposeDimensions(qkv, (2, 0, 3, 1, 4))
+        print(x.shape)
+        print("reshapeSize: " + ", ".join([str(i) for i in (x.shape[0], x.shape[1], 3, self.head_number, self.dim // self.head_number)]))
+        qkv = reshape(x, shape=(x.shape[0], x.shape[1], 3, self.head_number, self.dim // self.head_number))
+        query, key, value = qkv.permute(2, 0, 3, 1, 4)
 
         # Scale the attention
         query = query * self.scale
 
         # Calculated the attention, a learnable bias is added to fix the nonuniformity of the grid.
-        attention = query @ key.T  # @ denotes matrix multiplication
+        print("QUERY KEY SIZE")
+        print(query.shape)
+        print(key.shape)
+        attention = query @ key.permute(0, 1, 3, 2)  # @ denotes matrix multiplication
 
         # self.earth_specific_bias is a set of neural network parameters to optimize. 
+        print("ORIGINAL BIAS SHAPE")
+        print(self.earth_specific_bias.shape)
         EarthSpecificBias = self.earth_specific_bias[self.position_index]
 
         # Reshape the learnable bias to the same shape as the attention matrix
-        EarthSpecificBias = reshape(EarthSpecificBias, target_shape=(
+        print("EARTHBIAS")
+        print(EarthSpecificBias.shape)
+        EarthSpecificBias = reshape(EarthSpecificBias, shape=(
         self.window_size[0] * self.window_size[1] * self.window_size[2],
         self.window_size[0] * self.window_size[1] * self.window_size[2], self.type_of_windows, self.head_number))
-        EarthSpecificBias = TransposeDimensions(EarthSpecificBias, (2, 3, 0, 1))
-        EarthSpecificBias = reshape(EarthSpecificBias, target_shape=[1] + EarthSpecificBias.shape)
+        EarthSpecificBias = EarthSpecificBias.permute(2, 3, 0, 1)
+        EarthSpecificBias = reshape(EarthSpecificBias, shape=[1] + list(EarthSpecificBias.shape))
 
         # Add the Earth-Specific bias to the attention matrix
+        print("ATTENTION SIZE")
+        print(attention.shape)
+        print("EARTHBIAS")
+        print(EarthSpecificBias.shape)
+        # TODO: attention and bias have different size
         attention = attention + EarthSpecificBias
 
         # Mask the attention between non-adjacent pixels, e.g., simply add -100 to the masked element.
@@ -521,13 +577,17 @@ class EarthAttention3D(nn.Module):
         x = attention @ value.T  # @ denote matrix multiplication
 
         # Reshape tensor to the original shape
-        x = TransposeDimensions(x, (0, 2, 1))
-        x = reshape(x, target_shape=original_shape)
+        x = x.permute(0, 2, 1)
+        x = reshape(x, shape=original_shape)
 
         # Linear layer to post-process operated tensor
         x = self.linear2(x)
         x = self.dropout(x)
         return x
+    
+    def mask_attention(self, attention, mask):
+        # TODO
+        return attention
 
 
 class MLP(nn.Module):
@@ -561,6 +621,7 @@ def PerlinNoise():
     # Scaling factor between two octaves
     persistence = 0.5
     # see https://github.com/pvigier/perlin-numpy/ for the implementation of GenerateFractalNoise (e.g., from perlin_numpy import generate_fractal_noise_3d)
+    # TODO
     perlin_noise = noise_scale * GenerateFractalNoise((H, W), (period_number, period_number), octaves, persistence)
     return perlin_noise
 
