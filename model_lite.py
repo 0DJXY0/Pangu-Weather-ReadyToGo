@@ -18,9 +18,6 @@ from torch.nn.functional import pad
 import numpy as np
 import os
 from collections import OrderedDict
-import pandas as pd
-from datetime import date, timedelta
-from datetime import datetime
 
 
 from torch.nn.functional import pad
@@ -47,16 +44,12 @@ class DropPath(nn.Module):
     def forward(self, x):
         return drop_path(x, self.drop_rate, self.training)
 
-def LoadData(train_date):
-    today = train_date.strftime('%Y-%m-%d-%H-%M')
-    tomorrow = train_date + timedelta(days=1)
-    tomorrow = tomorrow.strftime('%Y-%m-%d-%H-%M')
-    train_dir = os.path.join(os.getcwd(), "forecasts")
-    print(os.path.join(train_dir,today))
-    input = np.load(os.path.join(os.path.join(train_dir,today), 'input_upper'  + '.npy')).astype(np.float32)
-    input_surface = np.load(os.path.join(os.path.join(train_dir,today), 'input_surface'  + '.npy')).astype(np.float32)
-    target  = np.load(os.path.join(os.path.join(train_dir,tomorrow), 'input_upper'  + '.npy')).astype(np.float32)
-    target_surface = np.load(os.path.join(os.path.join(train_dir,tomorrow), 'input_surface'  + '.npy')).astype(np.float32)
+def LoadData(step = 0):
+    train_dir = os.path.join(os.getcwd(), "train")
+    input = np.load(os.path.join(train_dir, 'input_upper_' + str(step) + '.npy')).astype(np.float32)
+    input_surface = np.load(os.path.join(train_dir, 'input_surface_' + str(step) + '.npy')).astype(np.float32)
+    target  = np.load(os.path.join(train_dir, 'input_upper_' + str(step+1) + '.npy')).astype(np.float32)
+    target_surface = np.load(os.path.join(train_dir, 'input_surface_' + str(step+1) + '.npy')).astype(np.float32)
     return input, input_surface, target, target_surface
 
 
@@ -64,45 +57,42 @@ def LoadData(train_date):
 def Train():
   '''Training code'''
   # Initialize the model, for some APIs some adaptation is needed to fit hardwares
-  if_cuda = torch.cuda.is_available()
-  print("if_cuda=", if_cuda)
-  gpu_count = torch.cuda.device_count()
-  print("gpu_count=", gpu_count)
-  device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+  '''
+  input, input_surface, target, target_surface = LoadData(0)
+  input_layer = PatchEmbedding((2, 4, 4), 192)
+  input2 = torch.from_numpy(input)
+  input_surface2 = torch.from_numpy(input_surface)
+  print(input2.shape)
+  print(input_surface2.shape)
+  x = input_layer.forward(input2, input_surface2)
+  print(x.shape)
+  return
+  '''
   model = PanguModel()
+  print(model.parameters())
   optimizer = Adam(model.parameters(), lr = 5e-4,weight_decay=3e-6)
-  model.to(device)
-  start_date = date(2007, 1, 1)
-  end_date = date(2007, 1, 31)
-  dates_pool = pd.date_range(start_date, end_date - timedelta(days=1), freq='d')
-  print(next(model.parameters()).device)
+
   # Train single Pangu-Weather model
-  epochs = 10
+  epochs = 100
   for i in range(epochs):
     # For each epoch, we iterate from 1979 to 2017
     # dataset_length is the length of your training data, e.g., the sample between 1979 and 2017
     optimizer.zero_grad()
-
-    for train_date in dates_pool:
+    dataset_length = 1
+    for step in range(dataset_length):
       # Load weather data at time t as the input; load weather data at time t+1/3/6/24 as the output
       # Note the data need to be randomly shuffled
       # Note the input and target need to be normalized, see Inference() for details
-      input, input_surface, target, target_surface = LoadData(train_date)
+      input, input_surface, target, target_surface = LoadData(step)
+
       # Call the model and get the output
       output, output_surface = model(input, input_surface)
 
       # We use the MAE loss to train the model
       # The weight of surface loss is 0.25
       # Different weight can be applied for differen fields if needed
-      target = torch.from_numpy(target)
-      target_surface = torch.from_numpy(target_surface)
+      loss = TensorAbs(output-target) + TensorAbs(output_surface-target_surface) * 0.25
 
-      loss = torch.norm(output-target,p='fro') + torch.norm(output_surface-target_surface,p='fro') * 0.25
-      print('----------------loss------------------')
-      print(i)
-      print(train_date)
-      print(loss/(torch.norm(output)+ torch.norm(output_surface)* 0.25))
-      print('----------------loss end -------------')
       # Call the backward algorithm and calculate the gratitude of parameters
       loss.backward()
 
@@ -112,7 +102,7 @@ def Train():
       optimizer.step()
 
   # Save the model at the end of the training stage
-  model_dir = os.path.join(os.getcwd(), os.path.join("models","lite24_2007_2.pt"))
+  model_dir = os.path.join(os.getcwd(), os.path.join("models","lite24.pt"))
   save(model.state_dict(),model_dir)
 
 
@@ -128,6 +118,7 @@ class PanguModel(nn.Module):
         # Four basic layers
         self.layer1 = EarthSpecificLayer(2, 192, drop_path_list[:2], 6)
         #optimizer = Adam(self.layer1.parameters(), lr=5e-4, weight_decay=3e-6)
+        print(self.layer1.parameters())
         self.layer2 = EarthSpecificLayer(6, 384, drop_path_list[2:], 12)
         self.layer3 = EarthSpecificLayer(6, 384, drop_path_list[2:], 12)
         self.layer4 = EarthSpecificLayer(2, 192, drop_path_list[:2], 6)
@@ -168,11 +159,10 @@ class PanguModel(nn.Module):
         x = self.layer4(x, 8, 360, 181)
 
         # Skip connect, in last dimension(C from 192 to 384)
-        x = x[:, :skip.shape[1], :]
-        x = concat((skip, x),2)
+        x = concat(skip, x)
 
         # Recover the output fields from patches
-        output, output_surface = self._output_layer(x,8,360,181)
+        output, output_surface = self._output_layer(x)
         return output, output_surface
 
 def LoadConstantMask():
@@ -180,7 +170,7 @@ def LoadConstantMask():
     land_mask = np.load(os.path.join(train_dir, 'land_mask_0.npy')).astype(np.float32)
     soil_type = np.load(os.path.join(train_dir, 'soil_type_0.npy')).astype(np.float32)
     topography = np.load(os.path.join(train_dir, 'topography_0.npy')).astype(np.float32)
-    return torch.from_numpy(land_mask).to("cuda:0"), torch.from_numpy(soil_type).to("cuda:0"), torch.from_numpy(topography).to("cuda:0")
+    return torch.from_numpy(land_mask), torch.from_numpy(soil_type), torch.from_numpy(topography)
 
 
 class PatchEmbedding(nn.Module):
@@ -200,12 +190,11 @@ class PatchEmbedding(nn.Module):
         pad3D = ZeroPad3d((0, 0, 1, 2, 1, 0))
         input = pad3D(ConstructTensor(input))
         input_surface = pad2D(ConstructTensor(input_surface))
-        input = input.to("cuda:0")
-        input_surface = input_surface.to("cuda:0")
+
         # Apply a linear projection for patch_size[0]*patch_size[1]*patch_size[2] patches, patch_size = (2, 4, 4) as in the original paper
-        # print(input.shape)
+        print(input.shape)
         input = self.conv(input)
-        # print(input.shape)
+        print(input.shape)
 
         # Add three constant fields to the surface fields
         input_surface = concat((input_surface, pad2D(self.land_mask), pad2D(self.soil_type), pad2D(self.topography)))
@@ -214,10 +203,6 @@ class PatchEmbedding(nn.Module):
         input_surface = self.conv_surface(input_surface)
         input_surface = reshape(input_surface, shape = (input_surface.shape[0],1, input_surface.shape[1],input_surface.shape[2]) )
 
-        # print('input_surface: ' )
-        # print(input_surface.shape)
-        # print('input_air: ')
-        # print(input.shape)
         # Concatenate the input in the pressure level, i.e., in Z dimension
         x = concat((input, input_surface),1)
 
@@ -240,28 +225,16 @@ class PatchRecovery(nn.Module):
     def forward(self, x, Z, H, W):
         # The inverse operation of the patch embedding operation, patch_size = (2, 4, 4) as in the original paper
         # Reshape x back to three dimensions
-        # print('recovery开始')
-        # print(x.shape)
         x = x.permute(0, 2, 1)
         x = reshape(x, shape=(x.shape[0], x.shape[1], Z, H, W))
-        # print(x.shape)
+
         # Call the transposed convolution
         output = self.conv(x[:, :, 1:, :, :])
         output_surface = self.conv_surface(x[:, :, 0, :, :])
 
         # Crop the output to remove zero-paddings
-        # print('shape before crop')
-        # print(output.shape)
-        # print(output_surface.shape)
-        output = crop(output,0,0,1440,721)
-        output = output[0,:,1:,:,:]
-        # print(output.shape)
-        output = output.permute(0,1,3,2)
-        # print(output.shape)
-        output_surface = crop(output_surface,0,0,1440,721)
-        output_surface = output_surface[0,:,:,:]
-        output_surface = output_surface.permute(0, 2, 1)
-        # print(output_surface.shape)
+        output = crop(output)
+        output_surface = crop(output_surface)
         return output, output_surface
 
 
@@ -276,16 +249,13 @@ class DownSample(nn.Module):
     def forward(self, x, Z, H, W):
         # Reshape x to three dimensions for downsampling
         x = reshape(x, shape=(x.shape[0], Z, H, W, x.shape[-1]))
-        # print('shape before padding')
-        # print(x.shape)
+
         # Padding the input to facilitate downsampling
-        pad3D = ZeroPad3d((0, 0, 0, 1, 0, 0))
+        pad3D = ZeroPad3d((0, 0, 1, 2, 1, 0))
         x = pad3D(x)
-        # print('shape after padding')
-        # print(x.shape)
 
         # Reorganize x to reduce the resolution: simply change the order and downsample from (8, 360, 182) to (8, 180, 91)
-        Z, H, W = x.shape[1],x.shape[2],x.shape[3]
+        Z, H, W = x.shape
         # Reshape x to facilitate downsampling
         x = reshape(x, shape=(x.shape[0], Z, H // 2, 2, W // 2, 2, x.shape[-1]))
         # Change the order of x
@@ -327,7 +297,7 @@ class UpSample(nn.Module):
         x = reshape(x, shape=(x.shape[0], 8, 360, 182, x.shape[-1]))
 
         # Crop the output to the input shape of the network
-        #x = crop(x)
+        x = crop(x)
 
         # Reshape x back
         x = reshape(x, shape=(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3], x.shape[-1]))
@@ -346,7 +316,7 @@ class EarthSpecificLayer(nn.Module):
         super(EarthSpecificLayer, self).__init__()
         self.depth = depth
         self.blocks = []
-        # print(depth)
+        print(depth)
         # Construct basic blocks
         for i in range(depth):
             self.blocks.append((str(i), EarthSpecificBlock(dim, drop_path_ratio_list[i], heads)))
@@ -405,36 +375,28 @@ class EarthSpecificBlock(nn.Module):
         ind = 0
         for _ in self.parameters():
             ind+=1
-        # print('length:',ind)
+        print('length:',ind)
 
     def forward(self, x, Z, H, W, roll):
         # Save the shortcut for skip-connection
         shortcut = x
-        # print('EarthSpecificBlock.forward的开头')
-        # print(x.shape)
+
         # Reshape input to three dimensions to calculate window attention
-        # TODO
-        x = x[:,:Z*H*W,:]
         x = reshape(x, shape=(x.shape[0], Z, H, W, x.shape[2]))
-        shortcut_shape = x.shape
 
         # Zero-pad input if needed
-        # print(x.shape)
-        # print("Z H W: " + ", ".join([str(i) for i in [Z, H, W]]))
-        # print("windowSize: " + ", ".join([str(i) for i in self.window_size]))
-        paddown = W % self.window_size[2]
-        pad3D = ZeroPad3d((0, 0, 0, -paddown, 0, 0))
+        print(x.shape)
+        print("Z H W: " + ", ".join([str(i) for i in [Z, H, W]]))
+        print("windowSize: " + ", ".join([str(i) for i in self.window_size]))
+        pad3D = ZeroPad3d((0, 0, 0, -1, 0, 0))
         x = pad3D(x)
-        shortcut = x
-        shortcut = reshape(x, shape = (shortcut_shape[0],-1,shortcut_shape[-1]))
-        # print('shape after pad')
-        # print(x.shape)
+
         # Store the shape of the input for restoration
         ori_shape = x.shape
 
-        #if roll:
+        if roll:
             # Roll x for half of the window for 3 dimensions
-            #x = torch.roll(x, shifts=(self.window_size[0] // 2, self.window_size[1] // 2, self.window_size[2] // 2))
+            x = roll(x, shift=[self.window_size[0] // 2, self.window_size[1] // 2, self.window_size[2] // 2])
             # Generate mask of attention masks
             # If two pixels are not adjacent, then mask the attention between them
             # Your can set the matrix element to -1000 when it is not adjacent, then add it to the attention
@@ -453,15 +415,15 @@ class EarthSpecificBlock(nn.Module):
 
         # Get data stacked in 3D cubes, which will further be used to calculated attention among each cube
         x_window = reshape(x_window, shape=(-1, self.window_size[0] * self.window_size[1] * self.window_size[2], x.shape[-1]))
-        # print("BLOCK X_WINDOW SHAPE")
-        # print(x_window.shape)
-        # print()
+        print("BLOCK X_WINDOW SHAPE")
+        print(x_window.shape)
+        print()
 
         # Apply 3D window attention with Earth-Specific bias
         # TODO: remove the next line if mask is defined
         mask = 0
         x_window = self.attention(x_window, mask)
-        # print(x_window.shape)
+        print(x_window.shape)
 
         # Reorganize data to original shapes
         x = reshape(x_window, shape=(
@@ -472,19 +434,17 @@ class EarthSpecificBlock(nn.Module):
         # Reshape the tensor back to its original shape
         x = reshape(x_window, shape=ori_shape)
 
-        # if roll:
-        #     # Roll x back for half of the window
-        #     x = torch.roll(x, shifts=[-self.window_size[0] // 2, -self.window_size[1] // 2, -self.window_size[2] // 2])
+        if roll:
+            # Roll x back for half of the window
+            x = roll(x, shift=[-self.window_size[0] // 2, -self.window_size[1] // 2, -self.window_size[2] // 2])
 
         # Crop the zero-padding
-        #x = crop(x)
+        x = crop(x)
 
         # Reshape the tensor back to the input shape
         x = reshape(x, shape=(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3], x.shape[4]))
 
         # Main calculation stages
-        # print(shortcut.shape)
-
         x = shortcut + self.drop_path(self.norm1(x))
         x = x + self.drop_path(self.norm2(self.linear(x)))
         return x
@@ -513,7 +473,7 @@ class EarthAttention3D(nn.Module):
         # You can run your code to record it, modify the code and rerun it
         # Record the number of different window types
         input_shape = [14,721,1440]
-        input_shape = [8,360,181]
+        input_shape = [14,726,1440]
         self.type_of_windows = (input_shape[0] // window_size[0]) * (input_shape[1] // window_size[1])
 
         # For each type of window, we will construct a set of parameters according to the paper
@@ -565,15 +525,15 @@ class EarthAttention3D(nn.Module):
         self.position_index = Flatten(self.position_index)
 
     def forward(self, x, mask):
-        # Record the original shape of the input
-        original_shape = x.shape
-
         # Linear layer to create query, key and value
         x = self.linear1(x)
 
+        # Record the original shape of the input
+        original_shape = x.shape
+
         # reshape the data to calculate multi-head attention
-        # print(x.shape)
-        # print("reshapeSize: " + ", ".join([str(i) for i in (x.shape[0], x.shape[1], 3, self.head_number, self.dim // self.head_number)]))
+        print(x.shape)
+        print("reshapeSize: " + ", ".join([str(i) for i in (x.shape[0], x.shape[1], 3, self.head_number, self.dim // self.head_number)]))
         qkv = reshape(x, shape=(x.shape[0], x.shape[1], 3, self.head_number, self.dim // self.head_number))
         query, key, value = qkv.permute(2, 0, 3, 1, 4)
 
@@ -581,19 +541,19 @@ class EarthAttention3D(nn.Module):
         query = query * self.scale
 
         # Calculated the attention, a learnable bias is added to fix the nonuniformity of the grid.
-        # print("QUERY KEY SIZE")
-        # print(query.shape)
-        # print(key.shape)
+        print("QUERY KEY SIZE")
+        print(query.shape)
+        print(key.shape)
         attention = query @ key.permute(0, 1, 3, 2)  # @ denotes matrix multiplication
 
         # self.earth_specific_bias is a set of neural network parameters to optimize. 
-        # print("ORIGINAL BIAS SHAPE")
-        # print(self.earth_specific_bias.shape)
+        print("ORIGINAL BIAS SHAPE")
+        print(self.earth_specific_bias.shape)
         EarthSpecificBias = self.earth_specific_bias[self.position_index]
 
         # Reshape the learnable bias to the same shape as the attention matrix
-        # print("EARTHBIAS")
-        # print(EarthSpecificBias.shape)
+        print("EARTHBIAS")
+        print(EarthSpecificBias.shape)
         EarthSpecificBias = reshape(EarthSpecificBias, shape=(
         self.window_size[0] * self.window_size[1] * self.window_size[2],
         self.window_size[0] * self.window_size[1] * self.window_size[2], self.type_of_windows, self.head_number))
@@ -601,19 +561,11 @@ class EarthAttention3D(nn.Module):
         EarthSpecificBias = reshape(EarthSpecificBias, shape=[1] + list(EarthSpecificBias.shape))
 
         # Add the Earth-Specific bias to the attention matrix
-        # print("ATTENTION SIZE")
-        # print(attention.shape)
-        # print("EARTHBIAS")
-        # print(EarthSpecificBias.shape)
+        print("ATTENTION SIZE")
+        print(attention.shape)
+        print("EARTHBIAS")
+        print(EarthSpecificBias.shape)
         # TODO: attention and bias have different size
-        W_long = attention.shape[0]
-        tmp = EarthSpecificBias
-        for _ in range(attention.shape[0]//EarthSpecificBias.shape[1]):
-            tmp = concat((tmp,EarthSpecificBias),1)
-
-        EarthSpecificBias = tmp[:,0:W_long,:,:,:]
-        # print("EARTHBIAS")
-        # print(EarthSpecificBias.shape)
         attention = attention + EarthSpecificBias
 
         # Mask the attention between non-adjacent pixels, e.g., simply add -100 to the masked element.
@@ -622,14 +574,10 @@ class EarthAttention3D(nn.Module):
         attention = self.dropout(attention)
 
         # Calculated the tensor after spatial mixing.
-        # print(attention.shape)
-        # print(value.permute(0, 1, 3, 2).shape)
-        x = attention @ value  # @ denote matrix multiplication
+        x = attention @ value.T  # @ denote matrix multiplication
 
         # Reshape tensor to the original shape
-        # print(x.shape)
-        # print(original_shape)
-        x = x.permute(0, 1, 3, 2, 4)
+        x = x.permute(0, 2, 1)
         x = reshape(x, shape=original_shape)
 
         # Linear layer to post-process operated tensor
@@ -652,10 +600,10 @@ class MLP(nn.Module):
         self.drop = Dropout(p=dropout_rate)
 
     def forward(self, x):
-        x = self.linear1(x)
+        x = self.linear(x)
         x = self.activation(x)
         x = self.drop(x)
-        x = self.linear2(x)
+        x = self.linear(x)
         x = self.drop(x)
         return x
 
@@ -678,3 +626,8 @@ def PerlinNoise():
     return perlin_noise
 
 
+def main():
+    Train()
+
+
+main()

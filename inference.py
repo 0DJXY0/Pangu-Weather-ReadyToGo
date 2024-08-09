@@ -4,14 +4,14 @@ import onnx
 import onnxruntime as ort
 from datetime import datetime, timedelta
 # Use GPU or CPU
-use_GPU = True
+use_GPU = False
 
 # The date and time of the initial field
 # date = '2023-07-03'
 date_time = datetime(
     year=2023, 
     month=7, 
-    day=9,
+    day=11,
     hour=23,
     minute=0)
 # time = '23:00'
@@ -21,7 +21,7 @@ date_time_final = datetime(
     year=2023, 
     month=7, 
     day=17,
-    hour=23,
+    hour=11,
     minute=0)
 
 final_result_dir = os.path.join(
